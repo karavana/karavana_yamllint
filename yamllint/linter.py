@@ -63,118 +63,101 @@ class LintProblem(object):
         return '%d:%d: %s' % (self.line, self.column, self.message)
 
 
+
+
+
+
 def get_cosmetic_problems(buffer, conf, filepath):
-    rules = conf.enabled_rules(filepath)
+    token_rules, line_rules, comment_rules = [], [], []
 
-    # Split token rules from line rules
-    token_rules = [r for r in rules if r.TYPE == 'token']
-    comment_rules = [r for r in rules if r.TYPE == 'comment']
-    line_rules = [r for r in rules if r.TYPE == 'line']
+    rule_ids = conf.enabled_rules(filepath)
+    for rule_id in rule_ids:
+        if rule_id.TYPE == 'line':
+            line_rules.append(rule_id)
+        elif rule_id.TYPE == 'comment':
+            comment_rules.append(rule_id)
+        elif rule_id.TYPE == 'token':
+            token_rules.append(rule_id)
+    
+    DISABLE_RE = re.compile(r'^# yamllint disable(?: rule:(\S+))*\s*$')
+    DISABLE_LINE_RE = re.compile(r'^# yamllint disable-line(?: rule:(\S+))*\s*$')
+    ENABLE_RE = re.compile(r'^# yamllint enable(?: rule:(\S+))*\s*$')
 
-    context = {}
-    for rule in token_rules:
-        context[rule.ID] = {}
 
-    class DisableDirective:
+    class DisabledRulesTracker:
         def __init__(self):
-            self.rules = set()
-            self.all_rules = {r.ID for r in rules}
+            self.disabled_rules = set()  # Set of rules currently disabled
+            self.all_rules = {rule.ID for rule in rule_ids}
 
-        def process_comment(self, comment):
+        def handle_directive(self, directive):
+            # Check for and parse disable directives
             try:
-                comment = str(comment)
+                directive = str(directive)
             except UnicodeError:
-                return  # this certainly wasn't a yamllint directive comment
+                return
 
-            if re.match(r'^# yamllint disable( rule:\S+)*\s*$', comment):
-                items = comment[18:].rstrip().split(' ')
-                rules = [item[5:] for item in items][1:]
-                if len(rules) == 0:
-                    self.rules = self.all_rules.copy()
-                else:
-                    for id in rules:
-                        if id in self.all_rules:
-                            self.rules.add(id)
+            disable_match = DISABLE_RE.match(directive)
+            enable_match = ENABLE_RE.match(directive)
+            disable_line_match = DISABLE_LINE_RE.match(directive)
 
-            elif re.match(r'^# yamllint enable( rule:\S+)*\s*$', comment):
-                items = comment[17:].rstrip().split(' ')
-                rules = [item[5:] for item in items][1:]
-                if len(rules) == 0:
-                    self.rules.clear()
-                else:
-                    for id in rules:
-                        self.rules.discard(id)
+            if disable_match or disable_line_match:
+                self.handle_disable_directive(directive)
+            elif enable_match:
+                self.handle_enable_directive(directive)
+            
 
+        def handle_disable_directive(self, directive):
+            """Handles disabling rules based on the comment directive."""
+            extracted = self.extract_rules(directive)
+            if not extracted:
+                self.disabled_rules = self.all_rules.copy()
+            else:
+                self.disabled_rules.update(r for r in rule_ids if r in self.all_rules)
+
+        def handle_enable_directive(self, directive):
+            """Handles enabling rules based on the comment directive."""
+            extracted = self.extract_rules(directive)
+            if not extracted:
+                self.disabled_rules.clear()
+            else:
+                for r in rule_ids:
+                    self.disabled_rules.discard(r)
+
+        def extract_rules(self, directive):
+            """Extracts rule IDs from the comment directive."""
+            parts = directive.split(' rule:')
+            # Return the list of rule IDs, ignore the first element as it's the directive part
+            return [part.strip() for part in parts[1:]]
         def is_disabled_by_directive(self, problem):
-            return problem.rule in self.rules
+            return problem.rule in self.disabled_rules
 
-    class DisableLineDirective(DisableDirective):
-        def process_comment(self, comment):
-            try:
-                comment = str(comment)
-            except UnicodeError:
-                return  # this certainly wasn't a yamllint directive comment
 
-            if re.match(r'^# yamllint disable-line( rule:\S+)*\s*$', comment):
-                items = comment[23:].rstrip().split(' ')
-                rules = [item[5:] for item in items][1:]
-                if len(rules) == 0:
-                    self.rules = self.all_rules.copy()
-                else:
-                    for id in rules:
-                        if id in self.all_rules:
-                            self.rules.add(id)
-
-    # Use a cache to store problems and flush it only when a end of line is
-    # found. This allows the use of yamllint directive to disable some rules on
-    # some lines.
-    cache = []
-    disabled = DisableDirective()
-    disabled_for_line = DisableLineDirective()
-    disabled_for_next_line = DisableLineDirective()
-
+    context = {rule_id.ID: {} for rule_id in token_rules}
+    disabled_rules_tracker = DisabledRulesTracker()
+        
     for elem in parser.token_or_comment_or_line_generator(buffer):
-        if isinstance(elem, parser.Token):
-            for rule in token_rules:
-                rule_conf = conf.rules[rule.ID]
-                for problem in rule.check(rule_conf,
-                                          elem.curr, elem.prev, elem.next,
-                                          elem.nextnext,
-                                          context[rule.ID]):
+        disabled_rules_tracker.handle_directive(elem)
+        if isinstance(elem, parser.Line):
+            for rule in line_rules:
+                for problem in rule.check(conf.rules.get(rule.ID, {}), elem):
+                    problem.level = conf.rules.get(rule.ID, {}).get('level')
                     problem.rule = rule.ID
-                    problem.level = rule_conf['level']
-                    cache.append(problem)
+                    if not disabled_rules_tracker.is_disabled_by_directive(problem):
+                        yield problem
         elif isinstance(elem, parser.Comment):
             for rule in comment_rules:
-                rule_conf = conf.rules[rule.ID]
-                for problem in rule.check(rule_conf, elem):
+                for problem in rule.check(conf.rules.get(rule.ID, {}), elem):
+                    problem.level = conf.rules.get(rule.ID, {}).get('level')
                     problem.rule = rule.ID
-                    problem.level = rule_conf['level']
-                    cache.append(problem)
-
-            disabled.process_comment(elem)
-            if elem.is_inline():
-                disabled_for_line.process_comment(elem)
-            else:
-                disabled_for_next_line.process_comment(elem)
-        elif isinstance(elem, parser.Line):
-            for rule in line_rules:
-                rule_conf = conf.rules[rule.ID]
-                for problem in rule.check(rule_conf, elem):
+                    if not disabled_rules_tracker.is_disabled_by_directive(problem):
+                        yield problem
+        elif isinstance(elem, parser.Token):
+            for rule in token_rules:
+                for problem in rule.check(conf.rules.get(rule.ID, {}), elem.curr, elem.prev, elem.next, elem.nextnext, context[rule.ID]):
+                    problem.level = conf.rules.get(rule.ID, {}).get('level')
                     problem.rule = rule.ID
-                    problem.level = rule_conf['level']
-                    cache.append(problem)
-
-            # This is the last token/comment/line of this line, let's flush the
-            # problems found (but filter them according to the directives)
-            for problem in cache:
-                if not (disabled_for_line.is_disabled_by_directive(problem) or
-                        disabled.is_disabled_by_directive(problem)):
-                    yield problem
-
-            disabled_for_line = disabled_for_next_line
-            disabled_for_next_line = DisableLineDirective()
-            cache = []
+                    if not disabled_rules_tracker.is_disabled_by_directive(problem):
+                        yield problem
 
 
 def get_syntax_error(buffer):
